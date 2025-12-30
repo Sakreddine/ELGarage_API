@@ -7,7 +7,7 @@ import axios from 'axios';
 
 // ⚠️ METTEZ VOTRE IP LOCALE ICI (ex: http://192.168.1.45:8000)
 // Si simulateur : http://127.0.0.1:8000 (iOS) ou http://10.0.2.2:8000 (Android)
-const API_URL = 'http://127.0.0.1:8000'; 
+const API_URL = 'https://elgarage-api.onrender.com'; 
 
 const Stack = createStackNavigator();
 
@@ -258,4 +258,5 @@ const styles = StyleSheet.create({
   label: { fontWeight: 'bold', marginBottom: 10 },
   resultBox: { backgroundColor: '#e8f4fd', padding: 15, borderRadius: 10, borderLeftWidth: 5, borderLeftColor: '#2196F3' },
   resultTitle: { fontSize: 18, fontWeight: 'bold', marginBottom: 5 }
+
 });
