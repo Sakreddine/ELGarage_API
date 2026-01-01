@@ -1,159 +1,178 @@
-import os
-import json
-import hashlib
-from datetime import date
-from typing import Optional
-
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from supabase import create_client, Client
-from groq import Groq
+from typing import Optional, List
+import os
 from dotenv import load_dotenv
 
-# --- CONFIGURATION ---
+# Import de vos modules locaux (assurez-vous qu'ils sont dans le dossier backend)
+from data_manager import DataManager 
+from ai_engine import AIEngine 
+
+# Chargement des variables d'environnement
 load_dotenv()
 
-SB_URL = os.getenv("SUPABASE_URL")
-SB_KEY = os.getenv("SUPABASE_KEY")
+app = FastAPI()
 
-if not SB_URL or not SB_KEY:
-    print("⚠️ ERREUR: Les clés SUPABASE sont manquantes dans .env")
+# --- INITIALISATION DES CLASSES ---
+# On initialise le DataManager et l'AIEngine une seule fois au démarrage
+try:
+    dm = DataManager()
+    print("✅ API: DataManager connecté.")
+except Exception as e:
+    print(f"❌ API: Erreur DataManager - {e}")
 
-app = FastAPI(title="ELGarage Mobile API", version="1.2")
+try:
+    # Récupération de la clé API Groq depuis les variables d'environnement ou la DB
+    groq_key = os.getenv("GROQ_API_KEY")
+    # Si pas dans le .env, on essaie de la récupérer via les settings de la DB
+    if not groq_key and dm.db_ready:
+        settings = dm.get_app_settings()
+        if settings:
+            groq_key = settings.get('groq_api_key')
+    
+    ai_engine = AIEngine(api_key=groq_key) if groq_key else None
+    if ai_engine: print("✅ API: Moteur IA prêt.")
+    else: print("⚠️ API: Moteur IA non configuré (Manque Clé Groq).")
 
-# --- AJOUT CLES CORS (Indispensable pour le mobile) ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+except Exception as e:
+    print(f"❌ API: Erreur AIEngine - {e}")
+    ai_engine = None
 
-supabase: Client = create_client(SB_URL, SB_KEY) if SB_URL and SB_KEY else None
 
-# --- MODÈLES DE DONNÉES ---
-class DiagnosticRequest(BaseModel):
-    user_id: int
-    vehicule_id: int
-    codes_defaut: str
-    symptomes: str
-    date_occurence: str = str(date.today())
+# ================= MODÈLES DE DONNÉES (Pydantic) =================
+# Ces classes définissent ce que le mobile a le droit d'envoyer
 
-class LoginRequest(BaseModel):
+class UserLogin(BaseModel):
     email: str
     password: str
 
-class RegisterRequest(BaseModel):
+class UserRegister(BaseModel):
     nom: str
     email: str
     password: str
-    adresse: str
+    adresse: Optional[str] = None
 
-# --- UTILITAIRES ---
-def hash_password(password: str):
-    return hashlib.sha256(password.encode()).hexdigest()
+class VehicleInput(BaseModel):
+    user_id: int
+    marque: str
+    modele: str
+    immatriculation: str
+    annee: int
+    km_actuel: int
+    nom: str
 
-def get_config_ia():
-    try:
-        res = supabase.table('app_settings').select("*").eq('id', 1).execute()
-        if res.data:
-            s = res.data[0]
-            return s.get('groq_api_key'), s.get('maintenance_mode', True)
-    except: pass
-    return None, True
+class AnalyzeInput(BaseModel):
+    user_id: int
+    vehicule_id: int
+    codes_defaut: Optional[str] = ""
+    symptomes: str
+    date_occurence: str
 
-def get_car_history_text(v_id):
-    txt = "--- HISTORIQUE ---\n"
-    try:
-        notes = supabase.table('historique_vehicules').select("*").eq('vehicule_id', v_id).order('date', desc=True).limit(5).execute()
-        for n in notes.data: txt += f"- {n.get('date')}: [{n.get('type_evenement')}] {n.get('notes')}\n"
-        diags = supabase.table('diagnostics_vehicules').select("*").eq('vehicule_id', v_id).order('date', desc=True).limit(3).execute()
-        for d in diags.data: txt += f"- {d.get('date')}: Code {d.get('code_defaut')} ({d.get('resume_ia')})\n"
-    except: pass
-    return txt
-
-def format_tech_sheet(car):
-    def v(k, u=""): return f"{car.get(k)} {u}" if car.get(k) else "N/A"
-    return f"""VEHICULE: {v('marque')} {v('modele')} {v('annee')}\nMOTEUR: {v('code_moteur')} | {v('cylindree', 'cc')} | {v('puissance_ch', 'ch')} | {v('carburant')}"""
-
-# --- ROUTES API ---
+# ================= ROUTES DE L'API =================
 
 @app.get("/")
-def ping(): return {"status": "online"}
+def read_root():
+    """Route de santé pour le monitoring (LED Vert/Rouge)"""
+    return {"status": "online", "message": "ELGarage API is running 🚀"}
 
-# 1. ROUTE INSCRIPTION
+# --- UTILISATEURS ---
+
 @app.post("/register")
-async def register_user(req: RegisterRequest):
-    print(f"📝 Inscription : {req.email}")
-    
-    # Vérifier si l'email existe déjà
-    existing = supabase.table('users').select("*").eq('email', req.email).execute()
-    if existing.data:
-        raise HTTPException(status_code=400, detail="Cet email est déjà utilisé.")
-    
-    # Création
-    new_user = {
-        "nom": req.nom,
-        "email": req.email,
-        "password_hash": hash_password(req.password),
-        "adresse": req.adresse,
-        "role": "user",
-        "ai_allowed": False
-    }
-    
-    try:
-        data = supabase.table('users').insert(new_user).execute()
-        if data.data:
-            return {"message": "Compte créé", "user": data.data[0]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    raise HTTPException(status_code=500, detail="Erreur création compte")
-
-# 2. ROUTE CONNEXION
-@app.post("/login")
-async def login_user(req: LoginRequest):
-    print(f"🔑 Connexion : {req.email}")
-    pwd_hash = hash_password(req.password)
-    
-    res = supabase.table('users').select("*").eq('email', req.email).eq('password_hash', pwd_hash).execute()
-    
-    if res.data:
-        return {"message": "Succès", "user": res.data[0]}
+def register(user: UserRegister):
+    success, message = dm.register_user(user.nom, user.email, user.password, user.adresse)
+    if success:
+        return {"message": "Inscription réussie", "email": user.email}
     else:
-        raise HTTPException(status_code=401, detail="Email ou mot de passe incorrect")
+        # On renvoie une erreur 400 pour que le mobile comprenne
+        raise HTTPException(status_code=400, detail=message)
 
-# 3. ROUTE ANALYSE
+@app.post("/login")
+def login(user: UserLogin):
+    success, message = dm.login_user(user.email, user.password)
+    if success:
+        # On renvoie les infos de l'utilisateur pour l'appli mobile
+        return {"message": "Connexion réussie", "user": dm.current_user}
+    else:
+        raise HTTPException(status_code=401, detail=message)
+
+# --- VÉHICULES (C'est ici que ça bloquait !) ---
+
+@app.post("/vehicles")
+def add_vehicle(v: VehicleInput):
+    """Ajouter un nouveau véhicule"""
+    try:
+        # On utilise directement Supabase via dm
+        response = dm.supabase.table('vehicules').insert({
+            "user_id": v.user_id,
+            "marque": v.marque,
+            "modele": v.modele,
+            "immatriculation": v.immatriculation,
+            "annee": v.annee,
+            "km_actuel": v.km_actuel,
+            "nom": v.nom
+        }).execute()
+        
+        if response.data:
+            return {"message": "Véhicule ajouté !", "vehicle": response.data[0]}
+        else:
+            raise HTTPException(status_code=400, detail="Erreur lors de l'enregistrement DB")
+            
+    except Exception as e:
+        print(f"Erreur Add Vehicle: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur serveur: {str(e)}")
+
+@app.get("/vehicles")
+def get_vehicles(user_id: int):
+    """Récupérer la liste des véhicules d'un utilisateur"""
+    try:
+        response = dm.supabase.table('vehicules').select("*").eq('user_id', user_id).execute()
+        return response.data # Renvoie une liste JSON
+    except Exception as e:
+        print(f"Erreur Get Vehicles: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- INTELLIGENCE ARTIFICIELLE ---
+
 @app.post("/analyze")
-async def analyze_diagnostic(req: DiagnosticRequest):
-    api_key, is_maint = get_config_ia()
-    if is_maint: raise HTTPException(503, "Maintenance")
-    if not api_key: raise HTTPException(500, "Config IA manquante")
-
-    u_data = supabase.table('users').select('role, ai_allowed').eq('id', req.user_id).execute()
-    if not u_data.data: raise HTTPException(404, "User inconnu")
-    user = u_data.data[0]
-    
-    if user['role'] != 'admin' and not user['ai_allowed']:
-        raise HTTPException(403, "IA non autorisée")
-
-    v_data = supabase.table('vehicules').select("*").eq('id', req.vehicule_id).execute()
-    if not v_data.data: raise HTTPException(404, "Véhicule introuvable")
-    
-    prompt = f"""Rôle: Mécanicien Expert.\n{format_tech_sheet(v_data.data[0])}\n{get_car_history_text(req.vehicule_id)}\nPanne: {req.codes_defaut} {req.symptomes}\nRéponds JSON: {{ "titre_rapport": "...", "resume_court": "...", "analyse_technique_detaillee": "...", "gravite_score": 1, "sante_vehicule": "ROUGE/ORANGE/VERT", "plan_action_propose": "...", "estimation_cout_pieces_mo": "..." }}"""
+def analyze_vehicle(data: AnalyzeInput):
+    """Lancer le diagnostic IA"""
+    if not ai_engine:
+        raise HTTPException(status_code=503, detail="Service IA non disponible (Clé API manquante sur le serveur).")
 
     try:
-        client = Groq(api_key=api_key)
-        chat = client.chat.completions.create(messages=[{"role":"user","content":prompt}], model="llama-3.3-70b-versatile", response_format={"type":"json_object"}, temperature=0.2)
-        result = json.loads(chat.choices[0].message.content)
-        
-        supabase.table('diagnostics_vehicules').insert({
-            'vehicule_id': req.vehicule_id, 'date': req.date_occurence,
-            'code_defaut': req.codes_defaut, 'resume_ia': result.get('resume_court'),
-            'analyse_ia': json.dumps(result), 'cout_estime': result.get('estimation_cout_pieces_mo'),
-            'sante_vehicule': result.get('sante_vehicule')
-        }).execute()
+        # 1. Récupérer les infos du véhicule
+        car_info = dm.get_vehicle_info(data.vehicule_id)
+        if not car_info:
+            raise HTTPException(status_code=404, detail="Véhicule introuvable.")
+
+        # 2. Récupérer l'historique complet (texte)
+        history_text = dm.get_full_history_text(data.vehicule_id)
+
+        # 3. Combiner codes et symptômes
+        probleme = f"Codes: {data.codes_defaut}. Symptômes: {data.symptomes}"
+
+        # 4. Appeler l'IA
+        result = ai_engine.analyze_obd(car_info, history_text, probleme, data.date_occurence)
+
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+
+        # 5. Sauvegarder le résultat (Optionnel mais recommandé)
+        dm.save_diagnostic(
+            data.vehicule_id, 
+            data.codes_defaut, 
+            str(result), 
+            result.get('estimation_cout_pieces_mo', 'N/A'),
+            result.get('sante_vehicule', 'VERT'),
+            data.date_occurence,
+            result.get('resume_court', 'Analyse IA')
+        )
+
         return result
+
+    except Exception as e:
+        print(f"Erreur Analyse: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+        return result
+
     except Exception as e: raise HTTPException(500, f"Erreur IA: {e}")
