@@ -7,7 +7,6 @@ class AIEngine:
         self.model = model_name
 
     def _format_technical_context(self, car):
-        """Transforme le dictionnaire brut de la DB en fiche technique lisible"""
         def val(k, unit=""):
             v = car.get(k)
             return f"{v} {unit}" if v is not None and v != "" else "N/A"
